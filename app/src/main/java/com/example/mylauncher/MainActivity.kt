@@ -77,9 +77,12 @@ fun HomeScreen(access: Boolean) {
             Text("Folder mod: /sdcard/vortex/mods", style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(enabled = installed, onClick = {
-                    ctx.packageManager.getLaunchIntentForPackage(MC_PACKAGE)?.let { ctx.startActivity(it) }
+                    logs.add(0, McHost.launch(ctx))
                 }) { Text("Launch") }
                 OutlinedButton(onClick = { mods = ModLoader.listMods() }) { Text("Refresh") }
+                OutlinedButton(onClick = {
+                    logs.addAll(0, ModLoader.loadAll(ctx))
+                }) { Text("Load all") }
             }
             Spacer(Modifier.height(12.dp))
             Text("Mods (${mods.size})", style = MaterialTheme.typography.titleMedium)
