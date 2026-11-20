@@ -1,4 +1,4 @@
-name: Build APK
+name: Vortex Launcher
 on:
   push:
   workflow_dispatch:
