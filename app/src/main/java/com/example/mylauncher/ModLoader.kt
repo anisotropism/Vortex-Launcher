@@ -17,10 +17,30 @@ object ModLoader {
         val dst = File(ctx.codeCacheDir, f.name)
         dst.delete()
         f.copyTo(dst)
-        dst.setReadOnly() // wajib di Android 14+
+        dst.setReadOnly()
         System.load(dst.absolutePath)
         "OK: ${f.name}"
     } catch (e: Throwable) {
         "GAGAL: ${f.name} (${e.message})"
+    }
+
+    // Load semua mod. Kalau ada yang butuh dependency (misal dobby),
+    // ulangi sampai urutannya benar.
+    fun loadAll(ctx: Context): List<String> {
+        val logs = mutableListOf<String>()
+        var pending = listMods()
+        while (pending.isNotEmpty()) {
+            val failed = mutableListOf<File>()
+            for (f in pending) {
+                val r = load(ctx, f)
+                if (r.startsWith("OK")) logs += r else failed += f
+            }
+            if (failed.size == pending.size) {
+                failed.forEach { logs += load(ctx, it) }
+                break
+            }
+            pending = failed
+        }
+        return logs
     }
 }
