@@ -6,34 +6,61 @@ import android.content.res.AssetManager
 import dalvik.system.BaseDexClassLoader
 import dalvik.system.PathClassLoader
 import java.io.File
+import java.lang.reflect.InvocationTargetException
 import java.util.zip.ZipFile
 
 object McHost {
-    private var prepared = false
+    private var dexDone = false
+    private var nativeDone = false
+    private var assetsDone = false
+    private var libsLoaded = false
+
+    private fun root(e: Throwable): Throwable {
+        var t = e
+        while (true) {
+            val next = if (t is InvocationTargetException) t.targetException else t.cause
+            if (next == null || next === t) return t
+            t = next
+        }
+    }
+
+    private inline fun <T> step(name: String, block: () -> T): T = try {
+        block()
+    } catch (e: Throwable) {
+        val r = root(e)
+        val where = r.stackTrace.take(3).joinToString(" < ") {
+            "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+        }
+        throw RuntimeException("[$name] ${r.javaClass.simpleName}: ${r.message} @ $where")
+    }
 
     fun launch(ctx: Context): String = try {
         val app = ctx.applicationContext
         val info = app.packageManager.getApplicationInfo(MC_PACKAGE, 0)
         val apks = listOf(info.sourceDir) + (info.splitSourceDirs?.toList() ?: emptyList())
 
-        if (!prepared) {
-            val libDir = extractLibs(app, apks)
-            injectDex(app, apks)
-            addNativePath(app, libDir)
-            addAssets(app, apks)
-            for (n in listOf("libc++_shared.so", "libfmod.so", "libminecraftpe.so")) {
-                System.load(File(libDir, n).absolutePath)
+        val libDir = step("extract") { extractLibs(app, apks) }
+        if (!dexDone) { step("dex") { injectDex(app, apks) }; dexDone = true }
+        if (!nativeDone) { step("nativePath") { addNativePath(app, libDir) }; nativeDone = true }
+        if (!assetsDone) { step("assets") { addAssets(app, apks) }; assetsDone = true }
+        if (!libsLoaded) {
+            step("loadLibs") {
+                for (n in listOf("libc++_shared.so", "libfmod.so", "libminecraftpe.so")) {
+                    System.load(File(libDir, n).absolutePath)
+                }
             }
-            prepared = true
+            libsLoaded = true
         }
-        ModLoader.loadAll(app)
-        ctx.startActivity(
-            Intent().setClassName(app.packageName, "com.mojang.minecraftpe.MainActivity")
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
+        step("mods") { ModLoader.loadAll(app) }
+        step("startActivity") {
+            ctx.startActivity(
+                Intent().setClassName(app.packageName, "com.mojang.minecraftpe.MainActivity")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
         "Launch dimulai"
     } catch (e: Throwable) {
-        "GAGAL: ${e.javaClass.simpleName}: ${e.message}"
+        "GAGAL ${e.message}"
     }
 
     // Ambil .so arm64 dari APK Minecraft (termasuk split) ke folder sendiri
@@ -75,9 +102,23 @@ object McHost {
     // Supaya NativeActivity bisa menemukan libminecraftpe lewat class loader
     private fun addNativePath(ctx: Context, dir: File) {
         val pl = pathList(ctx.classLoader)
-        val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
-        m.isAccessible = true
-        m.invoke(pl, listOf(dir))
+        try {
+            val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
+            m.isAccessible = true
+            m.invoke(pl, listOf(dir))
+        } catch (e: Throwable) {
+            // Cadangan: ubah langsung daftar folder native
+            val dirsF = pl.javaClass.getDeclaredField("nativeLibraryDirectories").apply { isAccessible = true }
+            val elemsF = pl.javaClass.getDeclaredField("nativeLibraryPathElements").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            val old = dirsF.get(pl) as List<File>
+            val dirs = ArrayList<File>(old)
+            if (!dirs.contains(dir)) dirs.add(0, dir)
+            val make = pl.javaClass.getDeclaredMethod("makeNativePathElements", List::class.java)
+                .apply { isAccessible = true }
+            dirsF.set(pl, dirs)
+            elemsF.set(pl, make.invoke(null, dirs))
+        }
     }
 
     // Asset game ada di APK Minecraft
