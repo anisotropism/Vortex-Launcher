@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.res.AssetManager
 import dalvik.system.BaseDexClassLoader
 import dalvik.system.PathClassLoader
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.util.zip.ZipFile
@@ -36,6 +37,8 @@ object McHost {
 
     fun launch(ctx: Context): String = try {
         val app = ctx.applicationContext
+        runCatching { HiddenApiBypass.addHiddenApiExemptions("L") }
+
         val info = app.packageManager.getApplicationInfo(MC_PACKAGE, 0)
         val apks = listOf(info.sourceDir) + (info.splitSourceDirs?.toList() ?: emptyList())
 
@@ -106,18 +109,21 @@ object McHost {
             val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
             m.isAccessible = true
             m.invoke(pl, listOf(dir))
-        } catch (e: Throwable) {
-            // Cadangan: ubah langsung daftar folder native
-            val dirsF = pl.javaClass.getDeclaredField("nativeLibraryDirectories").apply { isAccessible = true }
-            val elemsF = pl.javaClass.getDeclaredField("nativeLibraryPathElements").apply { isAccessible = true }
-            @Suppress("UNCHECKED_CAST")
-            val old = dirsF.get(pl) as List<File>
-            val dirs = ArrayList<File>(old)
-            if (!dirs.contains(dir)) dirs.add(0, dir)
-            val make = pl.javaClass.getDeclaredMethod("makeNativePathElements", List::class.java)
-                .apply { isAccessible = true }
-            dirsF.set(pl, dirs)
-            elemsF.set(pl, make.invoke(null, dirs))
+        } catch (e1: Throwable) {
+            try {
+                val dirsF = pl.javaClass.getDeclaredField("nativeLibraryDirectories").apply { isAccessible = true }
+                val elemsF = pl.javaClass.getDeclaredField("nativeLibraryPathElements").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                val old = dirsF.get(pl) as List<File>
+                val dirs = ArrayList<File>(old)
+                if (!dirs.contains(dir)) dirs.add(0, dir)
+                val make = pl.javaClass.getDeclaredMethod("makeNativePathElements", List::class.java)
+                    .apply { isAccessible = true }
+                dirsF.set(pl, dirs)
+                elemsF.set(pl, make.invoke(null, dirs))
+            } catch (e2: Throwable) {
+                throw RuntimeException("addNativePath: ${root(e1).message} || cadangan: ${root(e2).message}")
+            }
         }
     }
 
