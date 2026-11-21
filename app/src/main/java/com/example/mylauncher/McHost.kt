@@ -105,24 +105,17 @@ object McHost {
     // Supaya NativeActivity bisa menemukan libminecraftpe lewat class loader
     private fun addNativePath(ctx: Context, dir: File) {
         val pl = pathList(ctx.classLoader)
+        val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
+        m.isAccessible = true
         try {
-            val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
-            m.isAccessible = true
-            m.invoke(pl, listOf(dir))
+            m.invoke(pl, listOf(dir.absolutePath)) // Android baru: daftar String
         } catch (e1: Throwable) {
             try {
-                val dirsF = pl.javaClass.getDeclaredField("nativeLibraryDirectories").apply { isAccessible = true }
-                val elemsF = pl.javaClass.getDeclaredField("nativeLibraryPathElements").apply { isAccessible = true }
-                @Suppress("UNCHECKED_CAST")
-                val old = dirsF.get(pl) as List<File>
-                val dirs = ArrayList<File>(old)
-                if (!dirs.contains(dir)) dirs.add(0, dir)
-                val make = pl.javaClass.getDeclaredMethod("makeNativePathElements", List::class.java)
-                    .apply { isAccessible = true }
-                dirsF.set(pl, dirs)
-                elemsF.set(pl, make.invoke(null, dirs))
+                m.invoke(pl, listOf(dir)) // Android lama: daftar File
             } catch (e2: Throwable) {
-                throw RuntimeException("addNativePath: ${root(e1).message} || cadangan: ${root(e2).message}")
+                throw RuntimeException(
+                    "addNativePath String: ${root(e1).message} || File: ${root(e2).message}"
+                )
             }
         }
     }
