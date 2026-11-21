@@ -47,11 +47,7 @@ object McHost {
         if (!nativeDone) { step("nativePath") { addNativePath(app, libDir) }; nativeDone = true }
         if (!assetsDone) { step("assets") { addAssets(app, apks) }; assetsDone = true }
         if (!libsLoaded) {
-            step("loadLibs") {
-                for (n in listOf("libc++_shared.so", "libfmod.so", "libminecraftpe.so")) {
-                    System.load(File(libDir, n).absolutePath)
-                }
-            }
+            step("loadLibs") { loadGameLibs(libDir) }
             libsLoaded = true
         }
         step("mods") { ModLoader.loadAll(app) }
@@ -64,6 +60,35 @@ object McHost {
         "Launch dimulai"
     } catch (e: Throwable) {
         "GAGAL ${e.message}"
+    }
+
+    // Muat semua .so game: dependency dulu (ulangi sampai urutannya benar), libminecraftpe terakhir
+    private fun loadGameLibs(libDir: File) {
+        val all = (libDir.listFiles { f -> f.extension == "so" } ?: emptyArray()).toList()
+        val main = all.firstOrNull { it.name == "libminecraftpe.so" }
+            ?: throw RuntimeException(
+                "libminecraftpe.so tidak ada. Isi folder (${all.size}): ${all.map { it.name }}"
+            )
+
+        var pending = all.filter { it != main }
+            .sortedBy { if (it.name == "libc++_shared.so") 0 else 1 }
+        while (pending.isNotEmpty()) {
+            val failed = mutableListOf<File>()
+            for (f in pending) {
+                try { System.load(f.absolutePath) } catch (e: Throwable) { failed += f }
+            }
+            if (failed.size == pending.size) break
+            pending = failed
+        }
+
+        try {
+            System.load(main.absolutePath)
+        } catch (e: Throwable) {
+            val names = all.map { it.name.removePrefix("lib").removeSuffix(".so") }
+            throw RuntimeException(
+                "${root(e).message} | ada pairip=${all.any { it.name == "libpairipcore.so" }} | libs(${all.size}): $names"
+            )
+        }
     }
 
     // Ambil .so arm64 dari APK Minecraft (termasuk split) ke folder sendiri
