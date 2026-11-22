@@ -7,7 +7,9 @@ import dalvik.system.BaseDexClassLoader
 import dalvik.system.PathClassLoader
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
+import java.io.FileOutputStream
 import java.lang.reflect.InvocationTargetException
+import java.util.zip.CRC32
 import java.util.zip.ZipFile
 
 object McHost {
@@ -36,49 +38,55 @@ object McHost {
         throw RuntimeException("[$name] ${r.javaClass.simpleName}: ${r.message} @ $where")
     }
 
-    private fun saveReport() {
+    // Tulis ke /sdcard/vortex/libs.txt dan paksa tersimpan sebelum lanjut
+    private fun progress(msg: String) {
+        report += msg
         try {
             ModLoader.root.mkdirs()
-            File(ModLoader.root, "libs.txt").writeText(report.joinToString("\n"))
+            FileOutputStream(File(ModLoader.root, "libs.txt"), true).use { o ->
+                o.write((msg + "\n").toByteArray())
+                o.fd.sync()
+            }
         } catch (_: Throwable) {}
     }
 
     fun launch(ctx: Context): String = try {
         val app = ctx.applicationContext
         runCatching { HiddenApiBypass.addHiddenApiExemptions("L") }
+        report.clear()
+        runCatching { File(ModLoader.root, "libs.txt").delete() }
 
         val info = app.packageManager.getApplicationInfo(MC_PACKAGE, 0)
         val apks = listOf(info.sourceDir) + (info.splitSourceDirs?.toList() ?: emptyList())
+        progress("android ${android.os.Build.VERSION.SDK_INT}, apk: ${apks.size} file")
 
         val libDir = step("extract") { extractLibs(app, apks) }
-        if (!dexDone) { step("dex") { injectDex(app, apks) }; dexDone = true }
-        if (!nativeDone) { step("nativePath") { addNativePath(app, libDir) }; nativeDone = true }
-        if (!assetsDone) { step("assets") { addAssets(app, apks) }; assetsDone = true }
+        if (!dexDone) { step("dex") { injectDex(app, apks) }; dexDone = true; progress("dex ok") }
+        if (!nativeDone) { step("nativePath") { addNativePath(app, libDir) }; nativeDone = true; progress("nativePath ok") }
+        if (!assetsDone) { step("assets") { addAssets(app, apks) }; assetsDone = true; progress("assets ok") }
         if (!libsLoaded) {
             step("loadLibs") { loadGameLibs(libDir) }
             libsLoaded = true
         }
         step("mods") { ModLoader.loadAll(app) }
-        saveReport()
+        progress("mods ok, buka activity game")
         step("startActivity") {
             ctx.startActivity(
                 Intent().setClassName(app.packageName, "com.mojang.minecraftpe.MainActivity")
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }
-        "Launch dimulai\n" + report.joinToString("\n")
+        "Launch dimulai\n" + report.takeLast(6).joinToString("\n")
     } catch (e: Throwable) {
-        saveReport()
-        "GAGAL ${e.message}\n" + report.joinToString("\n")
+        progress("GAGAL ${e.message}")
+        "GAGAL ${e.message}"
     }
 
-    // Muat semua .so game: dependency dulu, libminecraftpe terakhir. Semua hasil dicatat.
     private fun loadGameLibs(libDir: File) {
-        report.clear()
         val all = (libDir.listFiles { f -> f.extension == "so" } ?: emptyArray()).toList()
-        report += "libs(${all.size}): " +
-            all.joinToString(" ") { it.name.removePrefix("lib").removeSuffix(".so") }
-        report += "libpairipcore ada=${all.any { it.name == "libpairipcore.so" }}"
+        progress("libs(${all.size}): " +
+            all.joinToString(" ") { it.name.removePrefix("lib").removeSuffix(".so") })
+        progress("libpairipcore ada=${all.any { it.name == "libpairipcore.so" }}")
 
         val main = all.firstOrNull { it.name == "libminecraftpe.so" }
             ?: throw RuntimeException("libminecraftpe.so tidak ada di folder")
@@ -86,34 +94,47 @@ object McHost {
         val first = listOf("libc++_shared.so", "libpairipcore.so")
         var pending = all.filter { it != main }
             .sortedBy { val i = first.indexOf(it.name); if (i >= 0) i else 99 }
-        val errors = mutableMapOf<String, String>()
 
         while (pending.isNotEmpty()) {
             val failed = mutableListOf<File>()
             for (f in pending) {
+                progress("load ${f.name} (${f.length()} byte)")
                 try {
                     System.load(f.absolutePath)
-                    errors.remove(f.name)
+                    progress("  ok")
                 } catch (e: Throwable) {
                     failed += f
-                    errors[f.name] = root(e).message ?: "?"
+                    progress("  gagal: ${root(e).message}")
                 }
             }
             if (failed.size == pending.size) break
             pending = failed
         }
-        pending.forEach { report += "gagal: ${it.name} -> ${errors[it.name]}" }
 
+        progress("load libminecraftpe.so (${main.length()} byte)")
         try {
             System.load(main.absolutePath)
-            report += "libminecraftpe: OK"
+            progress("  ok")
         } catch (e: Throwable) {
-            report += "libminecraftpe: GAGAL -> ${root(e).message}"
+            progress("  gagal: ${root(e).message}")
             throw RuntimeException("libminecraftpe gagal dimuat")
         }
     }
 
-    // Ambil .so arm64 dari APK Minecraft (termasuk split) ke folder sendiri
+    private fun crcOf(f: File): Long {
+        val c = CRC32()
+        f.inputStream().use { i ->
+            val buf = ByteArray(1 shl 16)
+            while (true) {
+                val n = i.read(buf)
+                if (n < 0) break
+                c.update(buf, 0, n)
+            }
+        }
+        return c.value
+    }
+
+    // Ambil .so arm64 dari APK Minecraft (termasuk split), cek CRC supaya tidak ada file rusak
     private fun extractLibs(ctx: Context, apks: List<String>): File {
         val out = File(ctx.filesDir, "mc/lib").apply { mkdirs() }
         for (apk in apks) ZipFile(apk).use { z ->
@@ -121,8 +142,15 @@ object McHost {
                 .filter { it.name.startsWith("lib/arm64-v8a/") && it.name.endsWith(".so") }
                 .forEach { e ->
                     val dst = File(out, File(e.name).name)
-                    if (!dst.exists() || dst.length() != e.size) {
+                    val ok = dst.exists() && dst.length() == e.size &&
+                        (e.crc == -1L || crcOf(dst) == e.crc)
+                    if (!ok) {
+                        dst.delete()
                         z.getInputStream(e).use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
+                        if (e.crc != -1L && crcOf(dst) != e.crc) {
+                            throw RuntimeException("CRC tidak cocok setelah extract: ${dst.name}")
+                        }
+                        progress("extract ulang: ${dst.name}")
                     }
                 }
         }
