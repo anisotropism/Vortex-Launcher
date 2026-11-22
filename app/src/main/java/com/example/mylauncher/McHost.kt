@@ -8,7 +8,10 @@ import dalvik.system.PathClassLoader
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.lang.reflect.InvocationTargetException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.zip.CRC32
 import java.util.zip.ZipFile
 
@@ -82,43 +85,88 @@ object McHost {
         "GAGAL ${e.message}"
     }
 
+    // Baca daftar dependency (DT_NEEDED) dari file ELF 64-bit
+    private fun neededOf(f: File): List<String> = try {
+        RandomAccessFile(f, "r").use { r ->
+            val le = ByteOrder.LITTLE_ENDIAN
+            val h = ByteArray(64); r.readFully(h)
+            val hb = ByteBuffer.wrap(h).order(le)
+            val phoff = hb.getLong(0x20)
+            val phentsize = hb.getShort(0x36).toInt() and 0xFFFF
+            val phnum = hb.getShort(0x38).toInt() and 0xFFFF
+            val ph = ByteArray(phentsize * phnum)
+            r.seek(phoff); r.readFully(ph)
+            val pb = ByteBuffer.wrap(ph).order(le)
+
+            class Seg(val off: Long, val vaddr: Long, val size: Long)
+            val loads = mutableListOf<Seg>()
+            var dyn: Seg? = null
+            for (i in 0 until phnum) {
+                val b = i * phentsize
+                val type = pb.getInt(b)
+                val seg = Seg(pb.getLong(b + 8), pb.getLong(b + 16), pb.getLong(b + 32))
+                if (type == 1) loads += seg
+                if (type == 2) dyn = seg
+            }
+            val d = dyn ?: return emptyList()
+            val db = ByteArray(d.size.toInt()); r.seek(d.off); r.readFully(db)
+            val dbb = ByteBuffer.wrap(db).order(le)
+            val needIdx = mutableListOf<Long>()
+            var strtab = 0L
+            var p = 0
+            while (p + 16 <= db.size) {
+                val tag = dbb.getLong(p); val v = dbb.getLong(p + 8)
+                if (tag == 0L) break
+                if (tag == 1L) needIdx += v
+                if (tag == 5L) strtab = v
+                p += 16
+            }
+            val seg = loads.firstOrNull { strtab >= it.vaddr && strtab < it.vaddr + it.size }
+                ?: return emptyList()
+            val strOff = strtab - seg.vaddr + seg.off
+            needIdx.map { idx ->
+                r.seek(strOff + idx)
+                val sb = StringBuilder()
+                while (true) {
+                    val c = r.read()
+                    if (c <= 0) break
+                    sb.append(c.toChar())
+                }
+                sb.toString()
+            }
+        }
+    } catch (e: Throwable) {
+        emptyList()
+    }
+
+    // Muat semua .so sesuai urutan dependency aslinya (dependency dulu), semuanya dicatat
     private fun loadGameLibs(libDir: File) {
         val all = (libDir.listFiles { f -> f.extension == "so" } ?: emptyArray()).toList()
-        progress("libs(${all.size}): " +
-            all.joinToString(" ") { it.name.removePrefix("lib").removeSuffix(".so") })
-        progress("libpairipcore ada=${all.any { it.name == "libpairipcore.so" }}")
+        val byName = all.associateBy { it.name }
+        progress("libs(${all.size})")
+        all.sortedBy { it.name }.forEach { f ->
+            progress("${f.name} butuh: ${neededOf(f).joinToString(" ")}")
+        }
 
-        val main = all.firstOrNull { it.name == "libminecraftpe.so" }
+        val main = byName["libminecraftpe.so"]
             ?: throw RuntimeException("libminecraftpe.so tidak ada di folder")
 
-        val first = listOf("libc++_shared.so", "libpairipcore.so")
-        var pending = all.filter { it != main }
-            .sortedBy { val i = first.indexOf(it.name); if (i >= 0) i else 99 }
-
-        while (pending.isNotEmpty()) {
-            val failed = mutableListOf<File>()
-            for (f in pending) {
-                progress("load ${f.name} (${f.length()} byte)")
-                try {
-                    System.load(f.absolutePath)
-                    progress("  ok")
-                } catch (e: Throwable) {
-                    failed += f
-                    progress("  gagal: ${root(e).message}")
-                }
+        val done = mutableSetOf<String>()
+        fun loadRec(f: File) {
+            if (!done.add(f.name)) return
+            neededOf(f).forEach { n -> byName[n]?.let { loadRec(it) } }
+            progress("load ${f.name} (${f.length()} byte)")
+            try {
+                System.load(f.absolutePath)
+                progress("  ok")
+            } catch (e: Throwable) {
+                progress("  gagal: ${root(e).message}")
+                if (f == main) throw RuntimeException("libminecraftpe gagal dimuat")
             }
-            if (failed.size == pending.size) break
-            pending = failed
         }
 
-        progress("load libminecraftpe.so (${main.length()} byte)")
-        try {
-            System.load(main.absolutePath)
-            progress("  ok")
-        } catch (e: Throwable) {
-            progress("  gagal: ${root(e).message}")
-            throw RuntimeException("libminecraftpe gagal dimuat")
-        }
+        loadRec(main)
+        all.forEach { loadRec(it) } // sisanya kalau ada yang belum terpanggil
     }
 
     private fun crcOf(f: File): Long {
