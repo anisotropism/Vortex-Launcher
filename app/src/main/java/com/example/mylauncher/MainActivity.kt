@@ -1,5 +1,7 @@
 package com.example.mylauncher
 
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -43,30 +45,106 @@ fun isMinecraftInstalled(ctx: Context): Boolean = try {
     ctx.packageManager.getPackageInfo(MC_PACKAGE, 0); true
 } catch (e: PackageManager.NameNotFoundException) { false }
 
-// Baca log sistem milik proses Vortex, ambil baris penting, simpan versi lengkap ke sdcard
-fun readCrashLog(): List<String> {
-    val full = try {
-        val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "threadtime", "-t", "2500"))
-        p.inputStream.bufferedReader().readText()
-    } catch (e: Throwable) {
-        return listOf("Gagal baca log: ${e.message}")
+// Simpan crash Java ke /sdcard/vortex/crash.txt
+fun installCrashHandler() {
+    val prev = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { t, e ->
+        try {
+            ModLoader.root.mkdirs()
+            File(ModLoader.root, "crash.txt")
+                .writeText("Thread: ${t.name}\n" + android.util.Log.getStackTraceString(e))
+        } catch (_: Throwable) {}
+        prev?.uncaughtException(t, e)
     }
+}
+
+fun reasonName(r: Int): String = when (r) {
+    ApplicationExitInfo.REASON_CRASH -> "CRASH (Java)"
+    ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+    ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED (dibunuh sinyal)"
+    ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+    ApplicationExitInfo.REASON_ANR -> "ANR"
+    ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+    ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+    ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INIT_FAILURE"
+    ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE"
+    else -> "LAINNYA ($r)"
+}
+
+fun printableRuns(b: ByteArray, min: Int = 6): List<String> {
+    val res = mutableListOf<String>()
+    val sb = StringBuilder()
+    for (x in b) {
+        val c = x.toInt() and 0xFF
+        if (c in 32..126) sb.append(c.toChar())
+        else {
+            if (sb.length >= min) res += sb.toString()
+            sb.setLength(0)
+        }
+    }
+    if (sb.length >= min) res += sb.toString()
+    return res
+}
+
+fun readCrashLog(ctx: Context): List<String> {
+    val out = mutableListOf<String>()
+
+    // 1. Crash Java yang sempat tercatat
+    val cf = File(ModLoader.root, "crash.txt")
+    if (cf.exists()) {
+        out += "== crash.txt =="
+        out += cf.readLines().take(25)
+    }
+
+    // 2. Alasan proses mati menurut Android (Android 11+)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        try {
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val list = am.getHistoricalProcessExitReasons(ctx.packageName, 0, 3)
+            if (list.isEmpty()) out += "Belum ada riwayat proses mati."
+            list.forEachIndexed { i, r ->
+                out += "== exit #$i: ${reasonName(r.reason)} status=${r.status} ${r.description ?: ""}"
+                if (i == 0) {
+                    try {
+                        val bytes = r.traceInputStream?.use { it.readBytes() }
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            try {
+                                ModLoader.root.mkdirs()
+                                File(ModLoader.root, "tombstone.bin").writeBytes(bytes)
+                            } catch (_: Throwable) {}
+                            val keys = listOf(".so", "SIG", "abort", "Check failed", "Fatal", "Exception", "pairip")
+                            val hits = printableRuns(bytes)
+                                .filter { s -> keys.any { s.contains(it, ignoreCase = true) } }
+                                .distinct()
+                                .take(25)
+                            out += if (hits.isEmpty()) listOf("(trace ada, tapi tidak ada teks penting)") else hits
+                        } else out += "(tidak ada trace)"
+                    } catch (e: Throwable) {
+                        out += "(gagal baca trace: ${e.message})"
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            out += "Gagal baca exit info: ${e.message}"
+        }
+    } else {
+        out += "Android < 11: exit info tidak tersedia."
+    }
+
+    // 3. Cadangan: logcat (sering kosong di MIUI/HyperOS)
     try {
-        ModLoader.root.mkdirs()
-        File(ModLoader.root, "log.txt").writeText(full)
+        val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "threadtime", "-t", "1500"))
+        val full = p.inputStream.bufferedReader().readText()
+        val keys = listOf("FATAL", "Fatal signal", "UnsatisfiedLink", "Caused by", "SIGSEGV", "SIGABRT", "dlopen")
+        val prefix = Regex("^\\S+\\s+\\S+\\s+\\d+\\s+\\d+\\s+")
+        val hits = full.lineSequence()
+            .filter { l -> keys.any { l.contains(it, ignoreCase = true) } }
+            .map { it.replace(prefix, "") }
+            .toList().takeLast(10)
+        if (hits.isNotEmpty()) { out += "== logcat =="; out += hits }
     } catch (_: Throwable) {}
 
-    val keys = listOf(
-        "FATAL", "AndroidRuntime", "Fatal signal", "UnsatisfiedLink", "pairip",
-        "Caused by", "Exception", "SIGSEGV", "SIGABRT", "abort", "dlopen", "mojang", "minecraft"
-    )
-    val prefix = Regex("^\\S+\\s+\\S+\\s+\\d+\\s+\\d+\\s+")
-    val hits = full.lineSequence()
-        .filter { l -> keys.any { l.contains(it, ignoreCase = true) } }
-        .map { it.replace(prefix, "") }
-        .toList()
-    return if (hits.isEmpty()) listOf("Tidak ada baris penting. Log lengkap: /sdcard/vortex/log.txt")
-    else hits.takeLast(25)
+    return out
 }
 
 class MainActivity : ComponentActivity() {
@@ -74,6 +152,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashHandler()
         setContent { MaterialTheme { HomeScreen(access) } }
     }
 
@@ -115,7 +194,7 @@ fun HomeScreen(access: Boolean) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
                     logs.clear()
-                    logs.addAll(readCrashLog())
+                    logs.addAll(readCrashLog(ctx))
                 }) { Text("Log") }
                 OutlinedButton(onClick = { logs.clear() }) { Text("Bersihkan") }
             }
@@ -136,9 +215,9 @@ fun HomeScreen(access: Boolean) {
             if (logs.isNotEmpty()) {
                 HorizontalDivider()
                 Column(
-                    Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())
+                    Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())
                 ) {
-                    logs.take(40).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                    logs.take(80).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
                 }
             }
         }
