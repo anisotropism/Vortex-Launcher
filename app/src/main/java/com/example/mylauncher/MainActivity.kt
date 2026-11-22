@@ -13,6 +13,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -40,6 +42,32 @@ fun requestAllFilesAccess(ctx: Context) {
 fun isMinecraftInstalled(ctx: Context): Boolean = try {
     ctx.packageManager.getPackageInfo(MC_PACKAGE, 0); true
 } catch (e: PackageManager.NameNotFoundException) { false }
+
+// Baca log sistem milik proses Vortex, ambil baris penting, simpan versi lengkap ke sdcard
+fun readCrashLog(): List<String> {
+    val full = try {
+        val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "threadtime", "-t", "2500"))
+        p.inputStream.bufferedReader().readText()
+    } catch (e: Throwable) {
+        return listOf("Gagal baca log: ${e.message}")
+    }
+    try {
+        ModLoader.root.mkdirs()
+        File(ModLoader.root, "log.txt").writeText(full)
+    } catch (_: Throwable) {}
+
+    val keys = listOf(
+        "FATAL", "AndroidRuntime", "Fatal signal", "UnsatisfiedLink", "pairip",
+        "Caused by", "Exception", "SIGSEGV", "SIGABRT", "abort", "dlopen", "mojang", "minecraft"
+    )
+    val prefix = Regex("^\\S+\\s+\\S+\\s+\\d+\\s+\\d+\\s+")
+    val hits = full.lineSequence()
+        .filter { l -> keys.any { l.contains(it, ignoreCase = true) } }
+        .map { it.replace(prefix, "") }
+        .toList()
+    return if (hits.isEmpty()) listOf("Tidak ada baris penting. Log lengkap: /sdcard/vortex/log.txt")
+    else hits.takeLast(25)
+}
 
 class MainActivity : ComponentActivity() {
     private var access by mutableStateOf(false)
@@ -84,6 +112,13 @@ fun HomeScreen(access: Boolean) {
                     logs.addAll(0, ModLoader.loadAll(ctx))
                 }) { Text("Load all") }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    logs.clear()
+                    logs.addAll(readCrashLog())
+                }) { Text("Log") }
+                OutlinedButton(onClick = { logs.clear() }) { Text("Bersihkan") }
+            }
             Spacer(Modifier.height(12.dp))
             Text("Mods (${mods.size})", style = MaterialTheme.typography.titleMedium)
 
@@ -100,7 +135,11 @@ fun HomeScreen(access: Boolean) {
             }
             if (logs.isNotEmpty()) {
                 HorizontalDivider()
-                logs.take(5).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                Column(
+                    Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())
+                ) {
+                    logs.take(40).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                }
             }
         }
     }
