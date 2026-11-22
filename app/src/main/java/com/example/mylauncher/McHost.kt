@@ -15,6 +15,7 @@ object McHost {
     private var nativeDone = false
     private var assetsDone = false
     private var libsLoaded = false
+    private val report = mutableListOf<String>()
 
     private fun root(e: Throwable): Throwable {
         var t = e
@@ -35,6 +36,13 @@ object McHost {
         throw RuntimeException("[$name] ${r.javaClass.simpleName}: ${r.message} @ $where")
     }
 
+    private fun saveReport() {
+        try {
+            ModLoader.root.mkdirs()
+            File(ModLoader.root, "libs.txt").writeText(report.joinToString("\n"))
+        } catch (_: Throwable) {}
+    }
+
     fun launch(ctx: Context): String = try {
         val app = ctx.applicationContext
         runCatching { HiddenApiBypass.addHiddenApiExemptions("L") }
@@ -51,43 +59,57 @@ object McHost {
             libsLoaded = true
         }
         step("mods") { ModLoader.loadAll(app) }
+        saveReport()
         step("startActivity") {
             ctx.startActivity(
                 Intent().setClassName(app.packageName, "com.mojang.minecraftpe.MainActivity")
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }
-        "Launch dimulai"
+        "Launch dimulai\n" + report.joinToString("\n")
     } catch (e: Throwable) {
-        "GAGAL ${e.message}"
+        saveReport()
+        "GAGAL ${e.message}\n" + report.joinToString("\n")
     }
 
-    // Muat semua .so game: dependency dulu (ulangi sampai urutannya benar), libminecraftpe terakhir
+    // Muat semua .so game: dependency dulu, libminecraftpe terakhir. Semua hasil dicatat.
     private fun loadGameLibs(libDir: File) {
+        report.clear()
         val all = (libDir.listFiles { f -> f.extension == "so" } ?: emptyArray()).toList()
-        val main = all.firstOrNull { it.name == "libminecraftpe.so" }
-            ?: throw RuntimeException(
-                "libminecraftpe.so tidak ada. Isi folder (${all.size}): ${all.map { it.name }}"
-            )
+        report += "libs(${all.size}): " +
+            all.joinToString(" ") { it.name.removePrefix("lib").removeSuffix(".so") }
+        report += "libpairipcore ada=${all.any { it.name == "libpairipcore.so" }}"
 
+        val main = all.firstOrNull { it.name == "libminecraftpe.so" }
+            ?: throw RuntimeException("libminecraftpe.so tidak ada di folder")
+
+        val first = listOf("libc++_shared.so", "libpairipcore.so")
         var pending = all.filter { it != main }
-            .sortedBy { if (it.name == "libc++_shared.so") 0 else 1 }
+            .sortedBy { val i = first.indexOf(it.name); if (i >= 0) i else 99 }
+        val errors = mutableMapOf<String, String>()
+
         while (pending.isNotEmpty()) {
             val failed = mutableListOf<File>()
             for (f in pending) {
-                try { System.load(f.absolutePath) } catch (e: Throwable) { failed += f }
+                try {
+                    System.load(f.absolutePath)
+                    errors.remove(f.name)
+                } catch (e: Throwable) {
+                    failed += f
+                    errors[f.name] = root(e).message ?: "?"
+                }
             }
             if (failed.size == pending.size) break
             pending = failed
         }
+        pending.forEach { report += "gagal: ${it.name} -> ${errors[it.name]}" }
 
         try {
             System.load(main.absolutePath)
+            report += "libminecraftpe: OK"
         } catch (e: Throwable) {
-            val names = all.map { it.name.removePrefix("lib").removeSuffix(".so") }
-            throw RuntimeException(
-                "${root(e).message} | ada pairip=${all.any { it.name == "libpairipcore.so" }} | libs(${all.size}): $names"
-            )
+            report += "libminecraftpe: GAGAL -> ${root(e).message}"
+            throw RuntimeException("libminecraftpe gagal dimuat")
         }
     }
 
@@ -133,10 +155,10 @@ object McHost {
         val m = pl.javaClass.getDeclaredMethod("addNativePath", java.util.Collection::class.java)
         m.isAccessible = true
         try {
-            m.invoke(pl, listOf(dir.absolutePath)) // Android baru: daftar String
+            m.invoke(pl, listOf(dir.absolutePath))
         } catch (e1: Throwable) {
             try {
-                m.invoke(pl, listOf(dir)) // Android lama: daftar File
+                m.invoke(pl, listOf(dir))
             } catch (e2: Throwable) {
                 throw RuntimeException(
                     "addNativePath String: ${root(e1).message} || File: ${root(e2).message}"
